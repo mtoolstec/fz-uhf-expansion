@@ -79,8 +79,9 @@ typedef struct {
 } UhfListMenuCtx;
 
 typedef enum {
-    UhfListMenuItemSave = 0,
-    UhfListMenuItemAbout = 1,
+    UhfListMenuItemSoundToggle = 0,
+    UhfListMenuItemSave = 1,
+    UhfListMenuItemAbout = 2,
 } UhfListMenuItem;
 
 typedef enum {
@@ -141,6 +142,7 @@ typedef struct {
     bool down_long_latched;
     uint32_t last_inv_cmd_tick;
     uint32_t last_tag_beep_tick;
+    bool tag_beep_enabled;
     UhfPage page;
     UhfPage about_return_page;
     size_t list_top_index;
@@ -548,6 +550,7 @@ static void uhf_set_status(UhfApp* app, const char* fmt, ...) {
 
 static void uhf_notify_tag_found(UhfApp* app) {
     if(!app || !app->notifications) return;
+    if(!app->tag_beep_enabled) return;
 
     app->last_tag_beep_tick = furi_get_tick();
     notification_message(app->notifications, &uhf_sequence_tag_found);
@@ -899,51 +902,67 @@ static bool uhf_list_menu_back_callback(void* context) {
 static void uhf_show_list_menu(UhfApp* app) {
     if(!app || !app->gui || !app->view_port) return;
 
-    Submenu* submenu = submenu_alloc();
-    ViewDispatcher* dispatcher = view_dispatcher_alloc();
-    if(!submenu || !dispatcher) {
-        if(submenu) submenu_free(submenu);
-        if(dispatcher) view_dispatcher_free(dispatcher);
-        return;
-    }
+    for(;;) {
+        Submenu* submenu = submenu_alloc();
+        ViewDispatcher* dispatcher = view_dispatcher_alloc();
+        if(!submenu || !dispatcher) {
+            if(submenu) submenu_free(submenu);
+            if(dispatcher) view_dispatcher_free(dispatcher);
+            return;
+        }
 
-    UhfListMenuCtx menu_ctx = {
-        .dispatcher = dispatcher,
-        .selected = UhfListMenuItemSave,
-        .submitted = false,
-    };
+        UhfListMenuCtx menu_ctx = {
+            .dispatcher = dispatcher,
+            .selected = UhfListMenuItemSoundToggle,
+            .submitted = false,
+        };
 
-    submenu_set_header(submenu, "UHF Expansion");
-    submenu_add_item(
-        submenu,
-        "Save",
-        UhfListMenuItemSave,
-        uhf_list_menu_submenu_callback,
-        &menu_ctx);
-    submenu_add_item(
-        submenu,
-        "About",
-        UhfListMenuItemAbout,
-        uhf_list_menu_submenu_callback,
-        &menu_ctx);
+        submenu_set_header(submenu, "UHF Expansion");
+        submenu_add_item(
+            submenu,
+            app->tag_beep_enabled ? "Sound: ON" : "Sound: OFF",
+            UhfListMenuItemSoundToggle,
+            uhf_list_menu_submenu_callback,
+            &menu_ctx);
+        submenu_add_item(
+            submenu,
+            "Save",
+            UhfListMenuItemSave,
+            uhf_list_menu_submenu_callback,
+            &menu_ctx);
+        submenu_add_item(
+            submenu,
+            "About",
+            UhfListMenuItemAbout,
+            uhf_list_menu_submenu_callback,
+            &menu_ctx);
 
-    view_dispatcher_set_event_callback_context(dispatcher, &menu_ctx);
-    view_dispatcher_set_navigation_event_callback(dispatcher, uhf_list_menu_back_callback);
-    view_dispatcher_add_view(dispatcher, 0, submenu_get_view(submenu));
+        view_dispatcher_set_event_callback_context(dispatcher, &menu_ctx);
+        view_dispatcher_set_navigation_event_callback(dispatcher, uhf_list_menu_back_callback);
+        view_dispatcher_add_view(dispatcher, 0, submenu_get_view(submenu));
 
-    gui_remove_view_port(app->gui, app->view_port);
-    view_dispatcher_attach_to_gui(dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-    view_dispatcher_switch_to_view(dispatcher, 0);
-    view_dispatcher_run(dispatcher);
+        gui_remove_view_port(app->gui, app->view_port);
+        view_dispatcher_attach_to_gui(dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+        view_dispatcher_switch_to_view(dispatcher, 0);
+        view_dispatcher_run(dispatcher);
 
-    view_dispatcher_remove_view(dispatcher, 0);
-    view_dispatcher_free(dispatcher);
-    submenu_free(submenu);
-    gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
+        view_dispatcher_remove_view(dispatcher, 0);
+        view_dispatcher_free(dispatcher);
+        submenu_free(submenu);
 
-    if(menu_ctx.submitted) {
+        if(!menu_ctx.submitted) break;
+
+        if(menu_ctx.selected == UhfListMenuItemSoundToggle) {
+            app->tag_beep_enabled = !app->tag_beep_enabled;
+            uhf_set_status(app, app->tag_beep_enabled ? "Sound: ON" : "Sound: OFF");
+            continue;
+        }
+
         uhf_list_menu_execute(app, menu_ctx.selected);
+        break;
     }
+
+    gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 }
 
 static void uhf_set_startup_text(UhfApp* app, const char* text, const char* subtext, uint8_t dots) {
@@ -2093,6 +2112,7 @@ static UhfApp* uhf_app_alloc(void) {
 
     memset(app, 0, sizeof(UhfApp));
 
+    app->tag_beep_enabled = true;
     app->tx_ext_pin = -1;
     app->rx_ext_pin = -1;
     app->serial_id = FuriHalSerialIdUsart;
