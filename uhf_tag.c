@@ -23,6 +23,11 @@ bool uhf_tag_epc_hex_to_ascii(const char* epc_hex, char* out, size_t out_size) {
     return out[0] != '\0';
 }
 
+bool uhf_tag_epc_length_ok(size_t epc_len) {
+    return epc_len == 0U ||
+           (epc_len >= 4U && epc_len <= (UHF_EPC_HEX_MAX / 2U) && (epc_len % 2U) == 0U);
+}
+
 bool uhf_tag_ascii_to_epc_hex(const char* ascii, char* out, size_t out_size) {
     if(!ascii || !out) return false;
     const size_t length = strlen(ascii);

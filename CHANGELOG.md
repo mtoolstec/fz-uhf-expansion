@@ -1,3 +1,11 @@
+v1.9:
+
+- Inventory keeps a tag whose PC word reports no EPC and shows it as No EPC.
+- TID and User reads skip the EPC select filter when the tag has no EPC, including a one-shot probe from the inventory menu and TID Decoder.
+- Save Tag reads the TID first and stores a record with an empty EPC line when that is the only identity.
+- Selecting a No EPC tag opens the TID bank. EPC, User, and Reserved are shown as not populated without a reader command. TID is read with one custom-inventory round that stops itself, instead of an unfiltered read that leaves the module scanning.
+- Writing a No EPC tag updates the TID without an EPC filter, using session S0, and leaves EPC, User, and Reserved writes blocked.
+
 v1.8:
 
 - Added reader frequency queries and linked FCC, ETSI, CHN_1*, CHN_2, and Custom presets to Reader Settings. CHN_1* uses an explicitly labelled 840–845 MHz custom spectrum because its native channel index table is absent from the reader manual.

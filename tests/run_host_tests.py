@@ -12,6 +12,7 @@ flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic",
          "-fsanitize=address,undefined", "-g", "-I", str(root)]
 cases = {
     "frequency": ["tests/uhf_frequency_test.c", "uhf_frequency.c", "uhf_protocol.c"],
+    "saved_tag": ["tests/uhf_saved_tag_test.c", "uhf_saved_tag.c", "uhf_tag.c", "uhf_protocol.c"],
     "settings_storage": ["tests/uhf_settings_storage_test.c", "uhf_settings.c", "uhf_storage.c"],
 }
 with tempfile.TemporaryDirectory(prefix="uhf-host-tests-") as directory:

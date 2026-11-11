@@ -56,6 +56,8 @@
 #define UHF_CMD_WRITE_TAG     0x82U
 #define UHF_CMD_LOCK_TAG      0x83U
 #define UHF_CMD_SET_EPC_MATCH 0x85U
+#define UHF_CMD_GET_SESSION   0x5AU
+#define UHF_CMD_SET_SESSION   0x5BU
 #define UHF_PAYLOAD_START_INV 0x01U
 #define UHF_DEFAULT_POWER_DBM 20U
 #define UHF_PROBE_TIMEOUT_MS  240U
@@ -260,6 +262,7 @@ typedef struct {
     bool action_confirm;
     UhfEpcDisplay epc_display;
     bool tid_decode_attempted;
+    uint32_t tid_only_since;
     uint32_t fuzz_sequence;
     char selected_epc[UHF_EPC_HEX_MAX + 1];
     char access_epc[UHF_EPC_HEX_MAX + 1];
@@ -287,6 +290,7 @@ typedef struct {
     size_t tag_data_scroll_line;
     bool epc_filter_active;
     bool tag_reply_ready;
+    bool custom_tid_read;
     bool tag_reply_checksum_ok;
     uint8_t tag_reply_cmd;
     uint8_t tag_reply[UHF_TAG_REPLY_MAX];
@@ -379,7 +383,7 @@ typedef struct {
 static uint8_t uhf_signal_bar_level(uint32_t raw_rssi, size_t epc_bytes) {
     /* UCM601 packs mode bits above a 25-bit signal magnitude. Normalize by EPC length. */
     const uint32_t magnitude = raw_rssi & 0x01FFFFFFU;
-    const uint32_t level = epc_bytes ? magnitude / epc_bytes : 0U;
+    const uint32_t level = magnitude / (epc_bytes ? epc_bytes : 12U);
     uint8_t filled = 0U;
     if(level) filled = 1U;
     if(level >= 50000U) filled = 2U;
@@ -1590,7 +1594,10 @@ static void uhf_prune_stale_tags(UhfApp* app, uint32_t max_age_ms) {
 static bool uhf_is_valid_epc(const uint8_t* epc, size_t epc_len) {
     static const uint8_t reader_placeholder[] = {0xE2U, 0x80U, 0x69U, 0x00U, 0x00U};
 
-    if(!epc || epc_len < 4U || epc_len > (UHF_EPC_HEX_MAX / 2U)) return false;
+    /* Length 0 is a tag whose PC word has no EPC. It is kept so its TID can be read. */
+    if(!uhf_tag_epc_length_ok(epc_len)) return false;
+    if(epc_len == 0U) return true;
+    if(!epc) return false;
 
     /* All-zero EPCs are recoverable tags, not invalid frames. Keeping them
        visible lets the user assign a new EPC after an earlier clear. */
@@ -1771,6 +1778,18 @@ static void uhf_clear_selected_epc_filter(UhfApp* app) {
     }
 }
 
+static bool uhf_force_clear_epc_filter(UhfApp* app) {
+    const uint8_t clear_mode = 0x01U;
+    if(!app ||
+       !uhf_wait_tag_reply(app, UHF_CMD_SET_EPC_MATCH, &clear_mode, 1U, 600U) ||
+       app->tag_reply_len != 1U || app->tag_reply[0] != 0x10U) {
+        if(app) uhf_set_status(app, "Clear EPC filter failed");
+        return false;
+    }
+    app->epc_filter_active = false;
+    return true;
+}
+
 static bool uhf_read_selected_bank_words(
     UhfApp* app,
     uint8_t memory_bank,
@@ -1862,7 +1881,7 @@ static bool uhf_error_may_ignore_epc_filter(uint8_t error) {
 /* A read reply carries PC(2) + EPC + CRC(2) + data. Only accept an
    unfiltered fallback when the tag in the field is the selected one. */
 static bool uhf_reply_matches_selected_epc(const UhfApp* app) {
-    if(!app || !app->access_epc[0] || app->tag_reply_len < 8U) return false;
+    if(!app || app->tag_reply_len < 8U) return false;
     const size_t record_len = app->tag_reply[2];
     const size_t record_end = 3U + record_len;
     if(record_end + 3U > app->tag_reply_len) return false;
@@ -1870,10 +1889,209 @@ static bool uhf_reply_matches_selected_epc(const UhfApp* app) {
                             app->tag_reply[record_end + 1U];
     if(read_len > record_len || record_len < read_len + 4U) return false;
     const size_t epc_len = record_len - read_len - 4U;
-    if(epc_len == 0U || epc_len * 2U + 1U > sizeof(app->selected_epc)) return false;
+    if(epc_len * 2U + 1U > sizeof(app->selected_epc)) return false;
+    /* A TID-only tag answers with PC and CRC and no EPC bytes. */
+    if(epc_len == 0U) return app->access_epc[0] == '\0';
+    if(!app->access_epc[0]) return false;
     char epc[sizeof(app->selected_epc)];
     if(!uhf_bytes_to_hex(&app->tag_reply[5], epc_len, epc, sizeof(epc))) return false;
     return strcmp(epc, app->access_epc) == 0;
+}
+
+static bool uhf_reply_epc(const UhfApp* app, char* epc, size_t epc_size, uint16_t* pc) {
+    if(!app || !epc || !epc_size || app->tag_reply_len < 6U) return false;
+    const size_t record_len = app->tag_reply[2];
+    const size_t record_end = 3U + record_len;
+    if(record_end + 1U > app->tag_reply_len || record_len < 2U) return false;
+    size_t read_len = app->tag_reply[record_end];
+    if(record_end + 2U <= app->tag_reply_len) {
+        const size_t extended = ((size_t)app->tag_reply[record_end] << 8U) |
+                                app->tag_reply[record_end + 1U];
+        if(extended > 0U && extended <= record_len) read_len = extended;
+    }
+    if(read_len > record_len || record_len < read_len + 4U) return false;
+    const size_t epc_len = record_len - read_len - 4U;
+    if(epc_len * 2U + 1U > epc_size) return false;
+    if(pc) *pc = (uint16_t)((app->tag_reply[3] << 8U) | app->tag_reply[4]);
+    if(epc_len == 0U) {
+        epc[0] = '\0';
+        return true;
+    }
+    return uhf_bytes_to_hex(&app->tag_reply[5], epc_len, epc, epc_size);
+}
+
+/* Drop a hung command so the next read is not parsed against leftover bytes. */
+static void uhf_settle_reader(UhfApp* app) {
+    uhf_stop_inventory(app);
+    furi_delay_ms(UHF_STOP_SETTLE_MS);
+    uhf_process_rx(app);
+    if(app->rx_stream) furi_stream_buffer_reset(app->rx_stream);
+    app->frame_buffer_len = 0U;
+}
+
+/* 0x8A match-TID: Ant, PC, EPC, CRC, length, TID bytes, then RSSI and frequency.
+   A blank EPC can report a zero length or omit that byte, so the TID is also
+   taken from the bytes between the CRC and the RSSI trailer. */
+static bool uhf_parse_custom_tid(
+    const uint8_t* data, size_t data_len, char* out, size_t out_size) {
+    if(!data || data_len < 6U) return false;
+    size_t epc_len = ((size_t)(((uint16_t)data[1] << 8U) | data[2]) >> 11U) & 0x1FU;
+    epc_len *= 2U;
+    size_t after_crc = 3U + epc_len + 2U;
+    if(after_crc >= data_len) {
+        epc_len = 0U;
+        after_crc = 5U;
+        if(after_crc >= data_len) return false;
+    }
+    const size_t remain = data_len - after_crc;
+    if(remain >= 1U) {
+        const size_t declared = data[after_crc];
+        if(declared >= 4U && (declared % 2U) == 0U && declared <= 16U &&
+           1U + declared <= remain) {
+            return uhf_bytes_to_hex(&data[after_crc + 1U], declared, out, out_size);
+        }
+    }
+    if(remain > 8U) {
+        const size_t with_length = remain - 8U;
+        if(with_length >= 4U && (with_length % 2U) == 0U && with_length <= 16U) {
+            return uhf_bytes_to_hex(&data[after_crc + 1U], with_length, out, out_size);
+        }
+        const size_t bare = remain - 7U;
+        if(bare >= 4U && (bare % 2U) == 0U && bare <= 16U) {
+            return uhf_bytes_to_hex(&data[after_crc], bare, out, out_size);
+        }
+    }
+    return false;
+}
+
+/* One inventory round that reads the TID and then stops by itself.
+   An unfiltered 0x81 read keeps the module scanning until Stop. */
+static bool uhf_custom_tid_round(
+    UhfApp* app,
+    uint8_t antenna,
+    uint8_t rounds,
+    uint8_t words,
+    char* out,
+    size_t out_size,
+    uint8_t* error) {
+    const uint8_t payload[] = {antenna, rounds, 0x01U, words};
+    *error = 0xFFU;
+    out[0] = '\0';
+    app->custom_tid_read = true;
+    app->tag_reply_ready = false;
+    app->tag_reply_len = 0U;
+    if(!uhf_send_command(app, UHF_CMD_INV_ALT, payload, sizeof(payload))) {
+        app->custom_tid_read = false;
+        return false;
+    }
+    uhf_set_status(app, "Reading TID...");
+    if(app->view_port) view_port_update(app->view_port);
+
+    bool got = false;
+    bool finished = false;
+    const uint32_t started = furi_get_tick();
+    while(!finished && (furi_get_tick() - started) < 3000U) {
+        uhf_process_rx(app);
+        if(!app->tag_reply_ready) {
+            furi_delay_ms(5U);
+            continue;
+        }
+        app->tag_reply_ready = false;
+        if(!app->tag_reply_checksum_ok) continue;
+        if(app->tag_reply_len == 1U) {
+            const uint8_t code = app->tag_reply[0];
+            if(code == 0x10U) continue;
+            if(code == 0x12U) {
+                finished = true;
+                if(!got) *error = 0x36U;
+                break;
+            }
+            *error = code;
+            finished = true;
+            break;
+        }
+        FURI_LOG_I(
+            TAG,
+            "Custom TID RX cmd=%02X len=%lu",
+            app->tag_reply_cmd,
+            (unsigned long)app->tag_reply_len);
+        if((app->tag_reply_cmd == 0x53U || app->tag_reply_cmd == UHF_CMD_INV_ALT) &&
+           uhf_parse_custom_tid(app->tag_reply, app->tag_reply_len, out, out_size)) {
+            got = true;
+            *error = 0U;
+            /* Stop any rounds still running, but keep custom_tid_read set so
+               the stop reply does not replace the TID status. */
+            uhf_stop_inventory(app);
+            furi_delay_ms(UHF_STOP_SETTLE_MS);
+            uhf_process_rx(app);
+            finished = true;
+            break;
+        }
+    }
+    app->custom_tid_read = false;
+    if(!finished) {
+        uhf_settle_reader(app);
+        if(!got) *error = 0xFFU;
+    }
+    return got;
+}
+
+typedef struct {
+    uint8_t session;
+    uint8_t target;
+    bool restore;
+} UhfSavedSession;
+
+/* A tag just seen by inventory stays quiet on the current session. S0
+   answers again as soon as the radio has been off. */
+static void uhf_begin_s0_session(UhfApp* app, UhfSavedSession* saved) {
+    saved->session = 0U;
+    saved->target = 0U;
+    saved->restore = false;
+    if(uhf_wait_tag_reply(app, UHF_CMD_GET_SESSION, NULL, 0U, 600U) && app->tag_reply_len >= 2U) {
+        saved->session = app->tag_reply[0];
+        saved->target = app->tag_reply[1];
+        saved->restore = saved->session <= 3U && saved->target <= 1U;
+    }
+    const uint8_t s0_target_a[] = {0x00U, 0x00U};
+    (void)uhf_wait_tag_reply(app, UHF_CMD_SET_SESSION, s0_target_a, sizeof(s0_target_a), 600U);
+}
+
+static void uhf_restore_session(UhfApp* app, const UhfSavedSession* saved) {
+    if(!saved || !saved->restore) return;
+    const uint8_t payload[] = {saved->session, saved->target};
+    (void)uhf_wait_tag_reply(app, UHF_CMD_SET_SESSION, payload, sizeof(payload), 600U);
+}
+
+static bool uhf_read_tid_without_epc(UhfApp* app, char* out, size_t out_size) {
+    uhf_settle_reader(app);
+    if(!uhf_force_clear_epc_filter(app)) {
+        uhf_settle_reader(app);
+        app->epc_filter_active = false;
+    }
+
+    UhfSavedSession saved_session;
+    uhf_begin_s0_session(app, &saved_session);
+
+    uint8_t error = 0xFFU;
+    bool ok = uhf_custom_tid_round(app, 0x01U, 0x08U, 4U, out, out_size, &error);
+    if(!ok) {
+        /* The TID-match round ended without a tag record. Read bank 2 directly
+           now that the tag can answer, and stop the radio if it does not. */
+        uhf_settle_reader(app);
+        furi_delay_ms(80U);
+        ok = uhf_read_selected_bank_words(
+            app, 0x02U, 0x00U, 4U, out, out_size, "TID", false);
+        if(!ok && !app->tag_reply_ready) uhf_settle_reader(app);
+        if(!ok && uhf_error_means_window_too_long(uhf_last_tag_reply_error(app))) {
+            ok = uhf_read_selected_bank_words(
+                app, 0x02U, 0x00U, 2U, out, out_size, "TID", false);
+            if(!ok && !app->tag_reply_ready) uhf_settle_reader(app);
+        }
+    }
+    uhf_restore_session(app, &saved_session);
+    if(ok) uhf_set_status(app, "TID read: %lu bytes", (unsigned long)(strlen(out) / 2U));
+    return ok;
 }
 
 static bool uhf_read_bank_with_fallback(
@@ -1884,7 +2102,16 @@ static bool uhf_read_bank_with_fallback(
     size_t out_size,
     const uint8_t* windows,
     size_t window_count) {
-    const bool filtered = !app->tag_access_unfiltered;
+    const bool blank_epc = app->access_epc[0] == '\0';
+    if(blank_epc && bank == 0x02U) {
+        return uhf_read_tid_without_epc(app, out, out_size);
+    }
+    /* A timed-out EPC-match clear must not block the unfiltered read. */
+    if(blank_epc && !uhf_force_clear_epc_filter(app)) {
+        uhf_settle_reader(app);
+        app->epc_filter_active = false;
+    }
+    const bool filtered = !app->tag_access_unfiltered && !blank_epc;
     bool ok = false;
     uint8_t error = 0xFFU;
 
@@ -1895,6 +2122,12 @@ static bool uhf_read_bank_with_fallback(
             app, bank, 0x00U, windows[i], out, out_size, name, filtered);
         if(ok) break;
         error = uhf_last_tag_reply_error(app);
+        /* No reply at all: recover the UART and try the next window.
+           A real tag error still stops the loop. */
+        if(blank_epc && !app->tag_reply_ready) {
+            uhf_settle_reader(app);
+            continue;
+        }
         if(!uhf_error_means_window_too_long(error)) break;
     }
 
@@ -1983,14 +2216,32 @@ static bool uhf_write_selected_bank_at(
         return false;
     }
 
-    /* Normal tag actions stay EPC-filtered. Fuzzing explicitly opts into an
-       unfiltered write because the source may be replaced by a target tag. */
-    if(!app->tag_access_unfiltered && !app->epc_filter_active &&
-       !uhf_set_selected_epc_filter(app)) {
+    /* A tag with no EPC can only be written on TID, and only without an EPC
+       match. Other banks stay blocked so a blank EPC cannot select another tag. */
+    const bool blank_tid = app->access_epc[0] == '\0' && bank == UhfTagBankTid;
+    UhfSavedSession saved_session = {0};
+    if(app->access_epc[0] == '\0' && !blank_tid) {
+        uhf_set_status(app, "EPC required");
         uhf_notify_write_result(app, false);
+        snprintf(app->write_popup_text, sizeof(app->write_popup_text), "EPC required");
+        if(app->view_port) view_port_update(app->view_port);
         return false;
     }
-    if(app->tag_access_unfiltered) uhf_clear_selected_epc_filter(app);
+    if(blank_tid) {
+        if(!uhf_force_clear_epc_filter(app)) {
+            uhf_settle_reader(app);
+            app->epc_filter_active = false;
+        }
+        uhf_begin_s0_session(app, &saved_session);
+    } else if(!app->tag_access_unfiltered && !app->epc_filter_active &&
+              !uhf_set_selected_epc_filter(app)) {
+        /* Normal tag actions stay EPC-filtered. Fuzzing explicitly opts into an
+           unfiltered write because the source may be replaced by a target tag. */
+        uhf_notify_write_result(app, false);
+        return false;
+    } else if(app->tag_access_unfiltered) {
+        uhf_clear_selected_epc_filter(app);
+    }
     furi_delay_ms(UHF_STOP_SETTLE_MS);
     uhf_led_send(app, &uhf_led_write_start);
     app->tag_write_led_active = true;
@@ -2003,7 +2254,16 @@ static bool uhf_write_selected_bank_at(
     memcpy(&payload[11], value, value_len);
     uhf_set_status(app, "Writing %s...", name);
     if(!uhf_wait_tag_reply(app, UHF_CMD_WRITE_TAG, payload, 11U + value_len, 3000U)) {
-        uhf_notify_write_result(app, false);
+        if(blank_tid) uhf_settle_reader(app);
+        uhf_restore_session(app, &saved_session);
+        if(blank_tid) {
+            uhf_set_status(app, "Reader timeout (0x82)");
+            uhf_notify_write_result(app, false);
+            snprintf(app->write_popup_text, sizeof(app->write_popup_text), "Reader timeout (0x82)");
+            if(app->view_port) view_port_update(app->view_port);
+        } else {
+            uhf_notify_write_result(app, false);
+        }
         return false;
     }
 
@@ -2015,8 +2275,16 @@ static bool uhf_write_selected_bank_at(
         if(record_end < app->tag_reply_len) status = app->tag_reply[record_end];
     }
     if(status != 0x10U) {
-        uhf_set_status(app, "%s write: %s", name, uhf_tag_error_text(status));
+        char message[64];
+        snprintf(
+            message, sizeof(message), "%s write: %s", name, uhf_tag_error_text(status));
+        uhf_restore_session(app, &saved_session);
+        uhf_set_status(app, "%s", message);
         uhf_notify_write_result(app, false);
+        if(blank_tid) {
+            snprintf(app->write_popup_text, sizeof(app->write_popup_text), "%s", message);
+            if(app->view_port) view_port_update(app->view_port);
+        }
         return false;
     }
 
@@ -2044,11 +2312,14 @@ static bool uhf_write_selected_bank_at(
            sizeof(verify),
            name,
            false)) {
+        if(blank_tid && !app->tag_reply_ready) uhf_settle_reader(app);
+        uhf_restore_session(app, &saved_session);
         uhf_set_status(app, "Write OK; verify failed");
         uhf_notify_write_result(app, false);
         return false;
     }
     if(strcmp(verify, value_hex) != 0) {
+        uhf_restore_session(app, &saved_session);
         uhf_set_status(app, "Verify mismatch");
         uhf_notify_write_result(app, false);
         return false;
@@ -2072,6 +2343,7 @@ static bool uhf_write_selected_bank_at(
     const uint8_t cache_bank =
         bank == UhfTagBankEpc ? 1U : (bank == UhfTagBankTid ? 2U : 3U);
     app->memory_cache_valid[cache_bank] = false;
+    uhf_restore_session(app, &saved_session);
     uhf_set_status(app, "%s write verified", name);
     uhf_notify_write_result(app, true);
     return true;
@@ -2701,7 +2973,11 @@ static bool uhf_add_inventory_tag(
     if(hit_count == 0U) hit_count = 1U;
 
     char epc_hex[UHF_EPC_HEX_MAX + 1];
-    if(!uhf_bytes_to_hex(epc, epc_len, epc_hex, sizeof(epc_hex))) return false;
+    if(epc_len == 0U) {
+        epc_hex[0] = '\0';
+    } else if(!uhf_bytes_to_hex(epc, epc_len, epc_hex, sizeof(epc_hex))) {
+        return false;
+    }
 
     if(uhf_capture_saved_write_report(app, epc_hex, pc, rssi)) return true;
     if(app->ascii_filter_active) {
@@ -2763,7 +3039,7 @@ static bool uhf_parse_pc_epc_at(
     size_t data_len,
     size_t pc_offset,
     uint8_t antenna) {
-    if(data_len < pc_offset + 4U) return false;
+    if(data_len < pc_offset + 2U) return false;
 
     const uint16_t pc = (uint16_t)((data[pc_offset] << 8) | data[pc_offset + 1U]);
     const size_t epc_words = (pc >> 11) & 0x1F;
@@ -2771,7 +3047,10 @@ static bool uhf_parse_pc_epc_at(
     const size_t epc_offset = pc_offset + 2U;
     const size_t meta_offset = epc_offset + epc_len;
 
-    if(epc_len == 0 || epc_len > (UHF_EPC_HEX_MAX / 2U) || data_len < meta_offset) return false;
+    if(!uhf_tag_epc_length_ok(epc_len) || data_len < meta_offset) return false;
+    /* A zero-length EPC still carries the RSSI and frequency trailer. A short
+       0x89 completion frame is status, not a tag. */
+    if(epc_len == 0U && data_len < meta_offset + 7U) return false;
 
     uint32_t rssi = 0;
     uint32_t frequency = 0;
@@ -2788,10 +3067,18 @@ static bool uhf_parse_inventory_buffer_frame(UhfApp* app, const uint8_t* data, s
 
     const size_t inv_data_len = data[0];
     const size_t required_len = 1U + inv_data_len + 4U + 3U + 1U + 1U;
-    if(inv_data_len < 4U || data_len < required_len) return false;
+    /* PC only (2) and PC+CRC (4) are TID-only tags. Odd lengths are truncated. */
+    if(inv_data_len < 2U || (inv_data_len % 2U) != 0U || data_len < required_len) return false;
 
     const uint8_t* inv_data = &data[1];
-    const size_t epc_len = inv_data_len - 4U;
+    const uint16_t pc = (uint16_t)((inv_data[0] << 8U) | inv_data[1]);
+    size_t epc_len;
+    if(inv_data_len <= 4U) {
+        if(((pc >> 11) & 0x1FU) != 0U) return false;
+        epc_len = 0U;
+    } else {
+        epc_len = inv_data_len - 4U;
+    }
     const size_t offset = 1U + inv_data_len;
     const uint8_t antenna = data[offset + 7U];
     uint32_t hit_count = data[offset + 8U];
@@ -2799,8 +3086,8 @@ static bool uhf_parse_inventory_buffer_frame(UhfApp* app, const uint8_t* data, s
     const uint32_t rssi = uhf_read_be(&data[offset], 4);
     const uint32_t frequency = uhf_read_be(&data[offset + 4U], 3);
 
-    return uhf_add_inventory_tag(app, &inv_data[2], epc_len, antenna, rssi, frequency, hit_count,
-                                 (uint16_t)((inv_data[0] << 8U) | inv_data[1]));
+    return uhf_add_inventory_tag(
+        app, epc_len ? &inv_data[2] : inv_data, epc_len, antenna, rssi, frequency, hit_count, pc);
 }
 
 static bool
@@ -2846,6 +3133,18 @@ static void uhf_handle_frame(UhfApp* app, const uint8_t* frame, size_t frame_siz
         (unsigned long)data_len,
         (checksum_acc == 0U) ? "ok" : "bad");
 
+    /* 0x8A match-TID replies use 0x53 for the tag and 0x8A for errors.
+       Capture them before the inventory parser treats 0x8A as a tag report. */
+    if(app->custom_tid_read && (cmd == 0x53U || cmd == UHF_CMD_INV_ALT)) {
+        const size_t copied = data_len > sizeof(app->tag_reply) ? sizeof(app->tag_reply) : data_len;
+        if(copied) memcpy(app->tag_reply, data, copied);
+        app->tag_reply_len = copied;
+        app->tag_reply_cmd = cmd;
+        app->tag_reply_checksum_ok = checksum_acc == 0U;
+        app->tag_reply_ready = true;
+        return;
+    }
+
     if(cmd == UHF_CMD_READ_TAG || cmd == UHF_CMD_WRITE_TAG || cmd == UHF_CMD_LOCK_TAG ||
        cmd == UHF_CMD_SET_EPC_MATCH || cmd == UHF_CMD_SET_POWER ||
        cmd == UHF_CMD_SAVE_PARAMS || cmd == UHF_CMD_SET_BUZZER || cmd == UHF_CMD_RESET ||
@@ -2864,7 +3163,8 @@ static void uhf_handle_frame(UhfApp* app, const uint8_t* frame, size_t frame_siz
        cmd == UHF_CMD_SET_EPC_MATCH || cmd == UHF_CMD_SET_POWER ||
        cmd == UHF_CMD_SAVE_PARAMS || cmd == UHF_CMD_SET_BUZZER || cmd == UHF_CMD_RESET ||
        cmd == UHF_CMD_GET_UUID || cmd == UHF_CMD_GET_FREQUENCY ||
-       cmd == UHF_CMD_SET_FREQUENCY) {
+       cmd == UHF_CMD_SET_FREQUENCY || cmd == UHF_CMD_GET_SESSION ||
+       cmd == UHF_CMD_SET_SESSION) {
         const size_t copied = data_len > sizeof(app->tag_reply) ? sizeof(app->tag_reply) :
                                                                   data_len;
         if(copied) memcpy(app->tag_reply, data, copied);
@@ -2930,7 +3230,7 @@ static void uhf_handle_frame(UhfApp* app, const uint8_t* frame, size_t frame_siz
             uhf_diag_log(app, "Inventory ended cmd=%02X len=%lu", cmd, (unsigned long)data_len);
         }
     } else if(cmd == UHF_CMD_STOP_INV) {
-        if(!app->inventory_running) {
+        if(!app->inventory_running && !app->custom_tid_read) {
             uhf_set_status(app, "Inventory stopped");
         }
     }
@@ -3441,7 +3741,8 @@ static size_t uhf_ascii_confirmed_tags(UhfApp* app, char* single_epc, size_t epc
     size_t count = 0U;
     for(size_t i = 0U; i < UHF_MAX_TAGS; i++) {
         const UhfTagEntry* tag = &app->tags[i];
-        if(!tag->used || tag->read_count < 2U || now - tag->last_seen > 1200U) continue;
+        if(!tag->used || !tag->epc[0] || tag->read_count < 2U || now - tag->last_seen > 1200U)
+            continue;
         if(count++ == 0U) {
             strncpy(single_epc, tag->epc, epc_size - 1U);
             single_epc[epc_size - 1U] = '\0';
@@ -3547,6 +3848,7 @@ static void uhf_enter_feature(UhfApp* app, uint8_t feature) {
         uhf_clear_tags(app);
         app->selected_tid_valid = false;
         app->tid_decode_attempted = false;
+        app->tid_only_since = 0U;
         app->tag_data_scroll_line = 0U;
         app->page = UhfPageTidDecoder;
         uhf_start_inventory(app);
@@ -3595,6 +3897,62 @@ static void uhf_enter_main_feature(UhfApp* app) {
 
 }
 
+/* Inventory reported nothing. Read TID with no EPC select and keep the tag. */
+static bool uhf_probe_tid_only_tag(UhfApp* app) {
+    if(!app || uhf_count_tags(app) != 0U) return false;
+    const bool resume_scan = app->inventory_running;
+    if(app->inventory_running) {
+        uhf_stop_inventory(app);
+        furi_delay_ms(UHF_STOP_SETTLE_MS);
+        uhf_process_rx(app);
+    }
+    if(uhf_count_tags(app) != 0U) {
+        if(resume_scan) uhf_start_inventory(app);
+        return false;
+    }
+
+    app->access_epc[0] = '\0';
+    app->selected_epc[0] = '\0';
+    app->selected_tid[0] = '\0';
+    app->selected_tid_valid = false;
+    app->tag_access_unfiltered = false;
+    uhf_set_status(app, "Reading TID...");
+    if(app->view_port) view_port_update(app->view_port);
+    if(!uhf_read_selected_tid(app)) return false;
+
+    char epc_hex[UHF_EPC_HEX_MAX + 1U] = "";
+    uint16_t pc = 0U;
+    (void)uhf_reply_epc(app, epc_hex, sizeof(epc_hex), &pc);
+    strncpy(app->access_epc, epc_hex, sizeof(app->access_epc) - 1U);
+    app->access_epc[sizeof(app->access_epc) - 1U] = '\0';
+    strncpy(app->selected_epc, epc_hex, sizeof(app->selected_epc) - 1U);
+    app->selected_epc[sizeof(app->selected_epc) - 1U] = '\0';
+    app->selected_pc = pc;
+
+    uint8_t epc_bytes[UHF_EPC_HEX_MAX / 2U];
+    size_t epc_len = 0U;
+    const uint8_t empty_epc = 0U;
+    const uint8_t* epc = &empty_epc;
+    if(epc_hex[0]) {
+        if(!uhf_hex_to_bytes(epc_hex, epc_bytes, sizeof(epc_bytes), &epc_len) || epc_len == 0U) {
+            return false;
+        }
+        epc = epc_bytes;
+    }
+    const bool filtered = app->ascii_filter_active;
+    app->ascii_filter_active = false;
+    const bool added = uhf_add_inventory_tag(app, epc, epc_len, 0U, app->selected_rssi, 0U, 1U, pc);
+    app->ascii_filter_active = filtered;
+    if(!added) return false;
+    if(uhf_count_tags(app) != 0U) {
+        app->list_selected_index = 0U;
+        app->list_top_index = 0U;
+        app->list_selection_manual = true;
+    }
+    uhf_set_status(app, epc_hex[0] ? "Tag found" : "TID-only tag");
+    return true;
+}
+
 static void uhf_service_feature_page(UhfApp* app) {
     if(!app || !app->inventory_running) return;
 
@@ -3633,9 +3991,25 @@ static void uhf_service_feature_page(UhfApp* app) {
             return;
         }
         if((now - app->security_single_since) < UHF_SINGLE_TAG_STABLE_MS) return;
+    } else if(
+        app->page == UhfPageTidDecoder && !app->selected_tid_valid && feature_tag_count == 0U &&
+        !app->tid_decode_attempted) {
+        const uint32_t now = furi_get_tick();
+        if(app->tid_only_since == 0U) {
+            app->tid_only_since = now;
+            return;
+        }
+        if((now - app->tid_only_since) < UHF_SINGLE_TAG_STABLE_MS) return;
+        app->tid_only_since = 0U;
+        if(!uhf_probe_tid_only_tag(app) && uhf_count_tags(app) == 0U) {
+            app->tid_decode_attempted = true;
+        }
+        return;
     } else if(feature_tag_count != 1U) {
+        app->tid_only_since = 0U;
         return;
     }
+    app->tid_only_since = 0U;
 
     if(app->page == UhfPageAscii && !app->ascii_tag_captured) {
         if(uhf_select_scanned_tag(app, app->ascii_candidate_epc)) {
@@ -3667,6 +4041,8 @@ static void uhf_service_feature_page(UhfApp* app) {
             (void)uhf_read_selected_tid(app);
         }
     } else if(app->page == UhfPageEpcFuzzing && !app->fuzz_base_epc[0]) {
+        UhfTagEntry source;
+        if(!uhf_copy_tag_at(app, 0U, &source) || !source.epc[0]) return;
         if(uhf_select_scanned_tag(app, NULL)) {
             strncpy(app->fuzz_base_epc, app->access_epc, sizeof(app->fuzz_base_epc) - 1U);
             app->fuzz_base_epc[sizeof(app->fuzz_base_epc) - 1U] = '\0';
@@ -4721,8 +5097,9 @@ static void uhf_draw_callback(Canvas* canvas, void* context) {
                     canvas_draw_box(canvas, 0, y - 8, 128, 9);
                     canvas_set_color(canvas, ColorWhite);
                 }
+                const char* epc_label = previews[row].epc[0] ? previews[row].epc : "No EPC";
                 const bool show_ascii =
-                    app->epc_display == UhfEpcDisplayAscii &&
+                    app->epc_display == UhfEpcDisplayAscii && previews[row].epc[0] &&
                     uhf_epc_hex_to_ascii(
                         previews[row].epc, app->list_ascii_epc, sizeof(app->list_ascii_epc));
                 if(show_ascii) {
@@ -4735,7 +5112,7 @@ static void uhf_draw_callback(Canvas* canvas, void* context) {
                     canvas_draw_str(canvas, 1, y, app->list_ascii_compact);
                     uhf_draw_signal_bars(canvas, previews[row].signal_bars, y);
                 } else {
-                    uhf_draw_list_epc_distributed(canvas, previews[row].epc, y);
+                    uhf_draw_list_epc_distributed(canvas, epc_label, y);
                     uhf_draw_signal_bars(canvas, previews[row].signal_bars, y);
                 }
                 if(app->list_selection_manual && idx == app->list_selected_index) {
@@ -5053,10 +5430,25 @@ static void uhf_reread_tag_bank(UhfApp* app) {
     } else if(app->tag_bank == UhfTagBankUser) {
         (void)uhf_read_selected_user(app);
     } else {
+        const bool blank_epc = app->access_epc[0] == '\0';
+        char bank_hex[9] = "";
         uhf_led_send(app, &uhf_led_read_start);
         const bool ok = uhf_read_selected_bank_words(
-            app, 1U, 2U, strlen(app->access_epc) / 4U,
-            app->selected_epc, sizeof(app->selected_epc), "EPC", true);
+            app,
+            1U,
+            blank_epc ? 0U : 2U,
+            blank_epc ? 2U : (uint8_t)(strlen(app->access_epc) / 4U),
+            blank_epc ? bank_hex : app->selected_epc,
+            blank_epc ? sizeof(bank_hex) : sizeof(app->selected_epc),
+            "EPC",
+            !blank_epc);
+        if(ok && blank_epc && strlen(bank_hex) >= 8U) {
+            uint8_t words[4];
+            size_t word_len = 0U;
+            if(uhf_hex_to_bytes(bank_hex, words, sizeof(words), &word_len) && word_len >= 4U) {
+                app->selected_pc = (uint16_t)((words[2] << 8U) | words[3]);
+            }
+        }
         uhf_led_send(app, ok ? &uhf_led_read_ok : &uhf_led_read_fail);
     }
 }
@@ -5342,8 +5734,11 @@ static void uhf_open_inventory_actions(UhfApp* app) {
         uhf_process_rx(app);
     }
     app->actions_tag_valid = false;
-    if(app->page == UhfPageList && app->list_selection_manual)
+    if(uhf_count_tags(app) == 0U && uhf_probe_tid_only_tag(app)) {
+        app->actions_tag_valid = true;
+    } else if(app->page == UhfPageList && app->list_selection_manual) {
         app->actions_tag_valid = uhf_enter_selected_tag(app);
+    }
     app->inventory_actions_active = true;
     app->inventory_details_direct = false;
     app->memory_readonly = false;
@@ -5353,6 +5748,11 @@ static void uhf_open_inventory_actions(UhfApp* app) {
 }
 
 static bool uhf_save_selected_tag(UhfApp* app, const char* name) {
+    if(!app->access_epc[0] && !app->selected_tid_valid && !uhf_read_selected_tid(app)) return false;
+    if(!app->access_epc[0] && !app->selected_tid[0]) {
+        uhf_set_status(app, "No TID to save");
+        return false;
+    }
     UhfSavedTag tag = {.pc = app->selected_pc, .rssi = app->selected_rssi};
     snprintf(tag.name, sizeof(tag.name), "%s", name);
     snprintf(tag.epc, sizeof(tag.epc), "%s", app->access_epc);
@@ -5689,6 +6089,35 @@ static void uhf_read_memory_page(UhfApp* app) {
     app->tag_bank = bank == 0U ? UhfTagBankReserved :
                     bank == 1U ? UhfTagBankEpc : bank == 2U ? UhfTagBankTid : UhfTagBankUser;
     app->page = UhfPageTagActions;
+    /* A tag with no EPC only has a TID. Other banks are not queried, so a
+       missing bank cannot time out and wedge the following TID read. */
+    if(!app->access_epc[0] && bank != 2U) {
+        app->memory_words = 0U;
+        app->memory_end = true;
+        uhf_set_status(app, "Not populated");
+        return;
+    }
+    if(!app->access_epc[0]) {
+        uhf_settle_reader(app);
+        app->memory_valid = uhf_read_selected_tid(app);
+        if(app->memory_valid) {
+            snprintf(app->memory_hex, sizeof(app->memory_hex), "%s", app->selected_tid);
+            app->memory_words = (uint8_t)(strlen(app->memory_hex) / 4U);
+            if(app->memory_address == 0U) {
+                snprintf(
+                    app->memory_cache[bank],
+                    sizeof(app->memory_cache[bank]),
+                    "%s",
+                    app->memory_hex);
+                app->memory_cache_words[bank] = app->memory_words;
+                app->memory_cache_valid[bank] = true;
+            }
+        } else {
+            app->memory_words = 0U;
+        }
+        app->memory_end = !app->memory_valid || app->memory_words < 16U;
+        return;
+    }
     uhf_led_send(app, &uhf_led_read_start);
     /* Clear the reader's EPC filter before an Inventory TID read. */
     if(bank == 2U) {
@@ -5710,7 +6139,7 @@ static void uhf_read_memory_page(UhfApp* app) {
     do {
         app->memory_valid = uhf_read_selected_bank_words(
             app, bank, app->memory_address, words, app->memory_hex,
-            sizeof(app->memory_hex), uhf_memory_banks[bank], bank != 2U);
+            sizeof(app->memory_hex), uhf_memory_banks[bank], bank != 2U && app->access_epc[0]);
         if(app->memory_valid || bank < 2U || words == 1U ||
            !uhf_error_means_window_too_long(uhf_last_tag_reply_error(app))) break;
         words--;
@@ -6445,12 +6874,14 @@ static void uhf_handle_input(UhfApp* app, const InputEvent* input) {
             if(app->selected_tid_valid) {
                 app->selected_tid_valid = false;
                 app->tid_decode_attempted = false;
+                app->tid_only_since = 0U;
                 app->tag_data_scroll_line = 0U;
                 uhf_clear_tags(app);
                 uhf_start_inventory(app);
                 uhf_set_status(app, "Present exactly one tag");
             } else {
                 app->tid_decode_attempted = false;
+                app->tid_only_since = 0U;
                 if(!app->inventory_running) uhf_start_inventory(app);
                 uhf_set_status(app, "Reading when one tag found");
             }
@@ -6503,7 +6934,7 @@ static void uhf_handle_input(UhfApp* app, const InputEvent* input) {
                     app->inventory_details_direct = true;
                     app->actions_resume_scan = false;
                     app->actions_return_page = UhfPageList;
-                    app->memory_selected = 1U;
+                    app->memory_selected = app->access_epc[0] ? 1U : 2U;
                     app->memory_address = 0U;
                     uhf_read_memory_page(app);
                 }
