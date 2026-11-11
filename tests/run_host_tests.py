@@ -22,4 +22,5 @@ with tempfile.TemporaryDirectory(prefix="uhf-host-tests-") as directory:
         subprocess.run([compiler, *flags, *extra,
                         *(str(root / source) for source in sources), "-o", executable], check=True)
         subprocess.run([executable], check=True)
-subprocess.run([sys.executable, str(root / "tests/run_settings_state_tests.py")], check=True)
+for script in ("run_settings_state_tests.py", "run_saved_write_tests.py", "run_tid_probe_tests.py"):
+    subprocess.run([sys.executable, str(root / "tests" / script)], check=True)
