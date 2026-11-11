@@ -42,6 +42,21 @@ static void test_normal_record(void) {
     assert(strcmp(tag.epc, "300833B2DDD9014000000001") == 0);
 }
 
+static void test_tid_length(void) {
+    const uint8_t ucode8[] = {
+        0xE2, 0x80, 0x68, 0x94, 0x20, 0x00, 0x40, 0x2E, 0x25, 0x67, 0x11, 0x22, 0x06, 0xEE};
+    const uint8_t short_header[] = {0xE2, 0x80, 0x68, 0x94, 0x20, 0x00, 0x40, 0x2E};
+    const uint8_t no_serial[] = {0xE2, 0x80, 0x11, 0x05, 0x00, 0x00, 0x30, 0xA5};
+    const uint8_t extended[] = {0xE2, 0x80, 0x68, 0x94, 0xA0, 0x00, 0x40, 0x2E};
+
+    assert(uhf_tag_tid_length(ucode8, sizeof(ucode8)) == 12U);
+    assert(uhf_tag_tid_length(short_header, sizeof(short_header)) == 12U);
+    assert(uhf_tag_tid_length(no_serial, sizeof(no_serial)) == 0U);
+    assert(uhf_tag_tid_length(extended, sizeof(extended)) == 0U);
+    assert(uhf_tag_tid_length(ucode8, 4U) == 0U);
+    assert(uhf_tag_tid_length(NULL, 8U) == 0U);
+}
+
 static void test_tid_only_record(void) {
     UhfSavedTag tag = {.name = "TID only", .tid = "E280110520007A3B", .pc = 0U, .rssi = 7U};
     UhfSavedTag loaded;
@@ -63,6 +78,7 @@ static void test_tid_only_record(void) {
 
 int main(void) {
     test_epc_length();
+    test_tid_length();
     test_normal_record();
     test_tid_only_record();
     return 0;

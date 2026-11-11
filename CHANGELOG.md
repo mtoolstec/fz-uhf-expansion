@@ -5,6 +5,9 @@ v1.9:
 - Save Tag reads the TID first and stores a record with an empty EPC line when that is the only identity.
 - Selecting a No EPC tag opens the TID bank. EPC, User, and Reserved are shown as not populated without a reader command. TID is read with one custom-inventory round that stops itself, instead of an unfiltered read that leaves the module scanning.
 - Writing a No EPC tag updates the TID without an EPC filter, using session S0, and leaves EPC, User, and Reserved writes blocked.
+- A TID read keeps the length declared by the XTID header, so a UCODE 8 serial is 12 bytes and bytes past that bank are dropped. Saved Write copies PC, EPC, TID, and User, including an empty EPC, through the existing TID write.
+- Cloning a tag with no EPC writes the PC length and the old EPC words together, clears Reserved, and shows both banks as not populated.
+- The inventory list shows a No EPC tag as TID followed by its value.
 
 v1.8:
 

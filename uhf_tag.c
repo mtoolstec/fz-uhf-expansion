@@ -28,6 +28,14 @@ bool uhf_tag_epc_length_ok(size_t epc_len) {
            (epc_len >= 4U && epc_len <= (UHF_EPC_HEX_MAX / 2U) && (epc_len % 2U) == 0U);
 }
 
+size_t uhf_tag_tid_length(const uint8_t* tid, size_t len) {
+    if(!tid || len < 6U) return 0U;
+    const uint16_t xtid = (uint16_t)(((uint16_t)tid[4] << 8U) | tid[5]);
+    /* Bit 13 set and bit 15 clear: serial present, no extended header. */
+    if((xtid & 0xA000U) == 0x2000U) return 12U;
+    return 0U;
+}
+
 bool uhf_tag_ascii_to_epc_hex(const char* ascii, char* out, size_t out_size) {
     if(!ascii || !out) return false;
     const size_t length = strlen(ascii);
