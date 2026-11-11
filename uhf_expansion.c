@@ -379,7 +379,6 @@ typedef struct {
 
 typedef struct {
     char epc[UHF_EPC_HEX_MAX + 1];
-    char tid[UHF_TID_HEX_MAX + 1];
     uint16_t count;
     uint8_t signal_bars;
 } UhfTagPreview;
@@ -505,7 +504,8 @@ static void uhf_draw_list_epc_distributed(Canvas* canvas, const char* epc, int y
 }
 
 static void uhf_draw_blank_epc_tid(Canvas* canvas, const char* tid, int y) {
-    char label[8U + UHF_TID_HEX_MAX + 1U];
+    /* The GUI thread stack is already full. This buffer stays off it. */
+    static char label[8U + UHF_TID_HEX_MAX + 1U];
     if(!tid || !tid[0]) {
         canvas_draw_str(canvas, 1, y, "TID - ...");
         return;
@@ -3548,12 +3548,6 @@ static size_t uhf_collect_tag_previews(
         const UhfTagEntry* tag = &app->tags[indices[index]];
         strncpy(out[copied].epc, tag->epc, sizeof(out[copied].epc) - 1);
         out[copied].epc[sizeof(out[copied].epc) - 1] = '\0';
-        if(!tag->epc[0]) {
-            strncpy(out[copied].tid, app->blank_epc_tid, sizeof(out[copied].tid) - 1U);
-            out[copied].tid[sizeof(out[copied].tid) - 1U] = '\0';
-        } else {
-            out[copied].tid[0] = '\0';
-        }
         out[copied].count = tag->read_count;
         out[copied].signal_bars = tag->last_seen && now - tag->last_seen <= UHF_SIGNAL_FRESH_MS ?
                                       tag->signal_bars : 0U;
@@ -5221,7 +5215,7 @@ static void uhf_draw_callback(Canvas* canvas, void* context) {
                     canvas_draw_str(canvas, 1, y, app->list_ascii_compact);
                     uhf_draw_signal_bars(canvas, previews[row].signal_bars, y);
                 } else if(!epc_label[0]) {
-                    uhf_draw_blank_epc_tid(canvas, previews[row].tid, y);
+                    uhf_draw_blank_epc_tid(canvas, app->blank_epc_tid, y);
                     uhf_draw_signal_bars(canvas, previews[row].signal_bars, y);
                 } else {
                     uhf_draw_list_epc_distributed(canvas, epc_label, y);
