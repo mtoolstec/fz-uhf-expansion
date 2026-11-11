@@ -37,6 +37,9 @@ names = [
     "uhf_begin_s0_session", "uhf_restore_session", "uhf_apply_tid_length",
     "uhf_tid_hex_declared", "uhf_read_tid_without_epc", "uhf_probe_tid_only_tag",
 ]
+# Access-key fixes split the bank reader into a keyed implementation and wrapper.
+if "static bool uhf_read_selected_bank_words_with_key(" in source:
+    names.insert(1, "uhf_read_selected_bank_words_with_key")
 session = source.index("typedef struct {", source.index("static bool uhf_custom_tid_round("))
 session_end = source.index("} UhfSavedSession;", session) + len("} UhfSavedSession;")
 block = source[session:session_end] + "\n\n" + "\n\n".join(map(function, names))

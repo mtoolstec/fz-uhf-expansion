@@ -1800,17 +1800,6 @@ static bool uhf_set_selected_epc_filter(UhfApp* app) {
     return true;
 }
 
-static void uhf_clear_selected_epc_filter(UhfApp* app) {
-    if(!app || !app->epc_filter_active) return;
-    const uint8_t clear_mode = 0x01U;
-    if(uhf_wait_tag_reply(app, UHF_CMD_SET_EPC_MATCH, &clear_mode, 1U, 600U) &&
-       app->tag_reply_len == 1U && app->tag_reply[0] == 0x10U) {
-        app->epc_filter_active = false;
-    } else {
-        uhf_set_status(app, "Clear EPC filter failed");
-    }
-}
-
 static bool uhf_force_clear_epc_filter(UhfApp* app) {
     const uint8_t clear_mode = 0x01U;
     if(!app ||
@@ -1821,6 +1810,17 @@ static bool uhf_force_clear_epc_filter(UhfApp* app) {
     }
     app->epc_filter_active = false;
     return true;
+}
+
+static void uhf_clear_selected_epc_filter(UhfApp* app) {
+    if(!app || !app->epc_filter_active) return;
+    const uint8_t clear_mode = 0x01U;
+    if(uhf_wait_tag_reply(app, UHF_CMD_SET_EPC_MATCH, &clear_mode, 1U, 600U) &&
+       app->tag_reply_len == 1U && app->tag_reply[0] == 0x10U) {
+        app->epc_filter_active = false;
+    } else {
+        uhf_set_status(app, "Clear EPC filter failed");
+    }
 }
 
 static bool uhf_read_selected_bank_words(
@@ -4768,7 +4768,7 @@ static void uhf_draw_saved_tags(Canvas* canvas, UhfApp* app) {
             if(!length) uhf_draw_centered_text(canvas, 37, "Not recorded");
             else {
                 char size[12];
-                snprintf(size, sizeof(size), "%luB", (unsigned long)(length / 2U));
+                snprintf(size, sizeof(size), "%uB", (unsigned)(length / 2U));
                 const int width = canvas_string_width(canvas, size);
                 canvas_set_color(canvas, ColorWhite);
                 canvas_draw_box(canvas, 117 - width, 11, width + 6U, 8);
